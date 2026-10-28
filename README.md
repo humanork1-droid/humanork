@@ -12,6 +12,10 @@ Netlify Drop (drag and drop) does not build functions, so use GitHub or the CLI.
 3. Site configuration > Environment variables: add `APP_PASSWORD`, `GEMINI_API_KEY`, `MAIL_USER`, and `MAIL_PASS` (plus `SMTP_HOST`/`SMTP_PORT` if your provider is not Gmail).
 4. Deploy, open the site, sign in with `APP_PASSWORD`.
 
+The static page lives in `public/`, which is the publish directory configured in
+`netlify.toml`. No build command is required. API, background, and scheduled functions
+live in `netlify/functions/`, with their shared modules in `netlify/lib/`.
+
 **Option B: CLI**
 ```
 npm i -g netlify-cli
