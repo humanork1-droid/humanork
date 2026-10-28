@@ -1,0 +1,128 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>AI SDR</title>
+<style>
+:root{--bg:#f3f5f7;--card:#fff;--ink:#14212b;--mute:#5d6c78;--line:#d8dee3;--acc:#0b6e69;--warn:#b4531a}
+@media(prefers-color-scheme:dark){:root{--bg:#10171c;--card:#18222a;--ink:#e6edf1;--mute:#93a3af;--line:#2a3944;--acc:#4fc3b9;--warn:#f0a070}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "Segoe UI",system-ui,sans-serif}
+main{max-width:900px;margin:auto;padding:16px}h1{font-size:22px;margin:8px 0 4px}h2{font-size:16px;margin:0 0 8px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:14px;margin:12px 0}
+button,input,textarea,select{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:4px;padding:7px 10px}
+button{cursor:pointer;background:var(--acc);color:#fff;border-color:var(--acc)}button.alt{background:none;color:var(--acc)}
+button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+button:disabled{opacity:.5;cursor:default}
+textarea{width:100%;min-height:70px}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:6px 0}
+.lead{border-top:1px solid var(--line);padding:10px 0}.mute{color:var(--mute);font-size:13px}.flag{color:var(--warn);font-weight:600}
+nav{display:flex;gap:6px;overflow-x:auto}nav button{background:none;color:var(--ink);border-color:var(--line)}nav button.on{background:var(--acc);color:#fff}
+pre{white-space:pre-wrap;font:inherit;margin:4px 0}
+#job{margin:10px 0;padding:10px 12px;border-radius:6px;border:1px solid var(--line);background:var(--card);display:none}
+#job.run{display:block;border-color:var(--acc)}#job.ok{display:block}#job.err{display:block;border-color:var(--warn);color:var(--warn)}
+#job button{float:right;padding:2px 8px}
+</style></head><body><main>
+<h1>AI SDR</h1><div class="mute" id="stat"></div>
+<div id="job" role="status" aria-live="polite"></div>
+<nav id="nav"></nav><div id="view"></div></main>
+<script>
+const tabs=["Setup","Leads","Review","Replies","Insights"];let tab="Setup",S={},PW=localStorage.getItem("sdr_pw")||"",timer=null,running=false;
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+async function api(p,o={}){
+ const r=await fetch("/api/"+p,{method:o.b?"POST":"GET",headers:{"Content-Type":"application/json",Authorization:"Bearer "+PW},body:o.b?JSON.stringify(o.b):undefined});
+ if(r.status===401){login();throw new Error("auth")}
+ if(p==="export.csv")return r;
+ return r.json();
+}
+function login(msg){
+ stat.textContent="";nav.innerHTML="";
+ view.innerHTML=`<div class="card"><h2>Sign in</h2><div class="mute">Enter the APP_PASSWORD you set in Netlify.${PW?" That password was wrong.":""}</div>
+ <div class="row"><input id="pw" type="password" autocomplete="current-password" placeholder="Password" style="flex:1 1 200px" onkeydown="if(event.key==='Enter')doLogin()"><button onclick="doLogin()">Sign in</button></div></div>`;
+ $("pw")?.focus();
+}
+function doLogin(){PW=$("pw").value;localStorage.setItem("sdr_pw",PW);load()}
+async function load(){
+ try{
+  S=await api("state");
+  if(S.error){view.innerHTML=`<div class="card flag">${esc(S.error)}</div>`;return}
+  S.ins=await api("insights");render();
+  if(!running){const j=await api("job");if(["queued","running"].includes(j.status))poll()}
+ }catch(e){if(e.message!=="auth")view.innerHTML=`<div class="card flag">Could not load: ${esc(e.message)}</div>`}
+}
+function render(){
+ stat.textContent=`${S.leads.length} leads, ${S.sent_today} sent today${S.cap?` (cap ${S.cap})`:""}${S.draft_only?" · draft-only mode":""} · AI: ${S.llm}${S.auto_run?" · auto-run on":""}`;
+ nav.innerHTML=tabs.map(t=>`<button class="${t==tab?"on":""}" onclick="tab='${t}';render()">${t}</button>`).join("");
+ view.innerHTML={Setup,Leads,Review,Replies,Insights}[tab]();
+}
+// quick synchronous actions
+const busy=async(fn)=>{document.body.style.opacity=.6;try{const r=await fn();if(r&&(r.error||r.summary))alert(r.error||r.summary)}finally{document.body.style.opacity=1;load()}};
+// long actions run as background jobs on Netlify; we poll for progress
+const names={research:"Researching",score:"Scoring",draft:"Writing emails",autopilot:"Scoring and writing",discover:"Finding companies",send:"Sending",crm:"Syncing CRM",inbox:"Checking inbox",paste:"Classifying reply",pipeline:"Running pipeline"};
+async function job(type,params={}){
+ const r=await api("job/start",{b:{type,params}});
+ if(r.error){alert(r.error);return}
+ poll();
+}
+function showJob(j){
+ const el=$("job");
+ if(j.status==="done"){el.className="ok";el.innerHTML=`<button class="alt" onclick="this.parentNode.className=''">Dismiss</button>✓ ${esc(j.summary)}`}
+ else if(j.status==="error"){el.className="err";el.innerHTML=`<button class="alt" onclick="this.parentNode.className=''">Dismiss</button>✕ ${esc(j.error)}`}
+ else{el.className="run";el.textContent=`⏳ ${names[j.type]||j.type}: ${j.progress||"working..."}`}
+}
+function poll(){
+ clearInterval(timer);running=true;
+ const tick=async()=>{
+  try{
+   const j=await api("job");if(!j.status){clearInterval(timer);running=false;return}
+   showJob(j);
+   if(j.status==="done"||j.status==="error"){clearInterval(timer);running=false;S=await api("state");S.ins=await api("insights");render()}
+  }catch(e){if(e.message==="auth"){clearInterval(timer);running=false}}
+ };
+ tick();timer=setInterval(tick,2000);
+}
+function Setup(){return `<div class="card"><h2>Who do you sell to?</h2>
+<textarea id="icp" placeholder="Example: Series A-B SaaS companies, 20-200 employees, selling to mid-market. Decision makers: VP Sales, Head of Growth.">${esc(S.icp)}</textarea>
+<div class="row"><input id="titles" placeholder="Target titles, comma separated" value="${esc(S.cfg.titles)}" style="flex:1 1 220px">
+<input id="minE" type="number" placeholder="Min employees" value="${esc(S.cfg.min_emp)}" style="width:130px"><input id="maxE" type="number" placeholder="Max employees" value="${esc(S.cfg.max_emp)}" style="width:130px">
+<input id="thr" type="number" min="0" max="100" placeholder="Min score (0-100)" value="${esc(S.cfg.threshold||60)}" style="width:150px"></div>
+<div class="mute">Leads scoring below the minimum are never drafted or contacted.</div>
+<div class="row"><button onclick="busy(()=>api('icp',{b:{icp:icp.value,titles:titles.value,min_emp:minE.value,max_emp:maxE.value,threshold:thr.value}}))">Save</button></div></div>
+<div class="card"><h2>Company mailbox</h2><div class="mute">Sending uses the SMTP mailbox configured in Netlify. Credentials are never stored in lead data. For Gmail, use an app password and set SMTP_HOST=smtp.gmail.com, SMTP_PORT=587, MAIL_USER, and MAIL_PASS.</div>
+<div class="row"><button class="alt" onclick="checkMailbox()">Verify mailbox connection</button><span id="mailStatus" class="mute"></span></div></div>
+<div class="card"><h2>Find leads from the web (free)</h2><div class="mute">Searches for companies that match your ICP and collects contact details they publish on their own sites. It finds fewer leads than a paid database, so check the list.</div>
+<div class="row"><input id="dn" type="number" value="10" style="width:90px"><button onclick="job('discover',{limit:+dn.value})">Find companies</button></div></div>
+<div class="card"><h2>Find leads with Apollo</h2><div class="row">
+<input id="ptitles" placeholder="Titles, comma separated" value="VP Sales, Head of Sales"><input id="kw" placeholder="Keywords">
+<input id="lim" type="number" value="25" style="width:80px"><button onclick="busy(()=>api('prospect',{b:{titles:ptitles.value.split(',').map(s=>s.trim()),keywords:kw.value,limit:lim.value}}))">Find leads</button></div></div>
+<div class="card"><h2>Or upload a CSV</h2><div class="mute">Columns: name, email, title, company, domain (optional: employees, industry)</div>
+<div class="row"><input type="file" id="csv" accept=".csv"><button onclick="up()">Upload</button></div></div>`}
+async function up(){const f=$("csv").files[0];if(!f){alert("Choose a CSV file first.");return}const csv=await f.text();busy(()=>api("upload",{b:{csv}}))}
+async function checkMailbox(){const el=$("mailStatus");el.textContent="Checking…";const r=await api("mailbox");el.textContent=r.connected?`✓ ${r.summary} (${r.user})`:`✕ ${r.error}`;el.className=r.connected?"":"flag"}
+async function exportCsv(){const r=await api("export.csv");const u=URL.createObjectURL(await r.blob());const a=document.createElement("a");a.href=u;a.download="leads.csv";a.click();URL.revokeObjectURL(u)}
+function Leads(){return `<div class="row"><button onclick="job('pipeline',{discover:10})">Run full pipeline</button>
+<button class="alt" onclick="job('autopilot',{limit:10})">Score and write top 10</button>
+<button class="alt" onclick="job('send')">Send approved</button>
+<button class="alt" onclick="job('crm')">Sync to CRM</button>
+<button class="alt" onclick="exportCsv()">Export CSV</button></div>`+
+ (S.leads.map(l=>`<div class="card lead"><b>${esc(l.name)}</b> ${l.score!=null?`<span class="flag" style="color:${l.score>=(+S.cfg.threshold||60)?'var(--acc)':'var(--mute)'}">${l.score}/100</span>`:""} <span class="mute">${esc(l.title)}, ${esc(l.company)} · ${esc(l.status)}</span>
+ ${l.score_reason?`<div class="mute">${esc(l.score_reason)}</div>`:""}
+ ${l.flag?`<div class="flag">${esc(l.flag)}</div>`:""}${l.research?`<pre class="mute">${esc(l.research)}</pre>`:""}
+ <div class="row"><button class="alt" onclick="job('research',{id:'${l.id}'})">Research</button>
+ <button class="alt" onclick="job('score',{id:'${l.id}'})">Score</button>
+ <button class="alt" onclick="job('draft',{id:'${l.id}'})">Write emails</button></div></div>`).join("")||`<div class="card">No leads yet. Add some in Setup.</div>`)}
+function Review(){const by={};S.drafts.forEach(d=>(by[d.lead_id]??=[]).push(d));
+ return Object.values(by).map(ds=>`<div class="card"><h2>${esc(ds[0].name)} at ${esc(ds[0].company)}</h2>`+ds.sort((a,b)=>a.step-b.step).map(d=>`
+ <div class="mute">Email ${d.step+1}${d.approved?" (approved)":""}</div><input id="s${d.id}" style="width:100%" value="${esc(d.subject)}">
+ <textarea id="b${d.id}" style="min-height:110px">${esc(d.body)}</textarea>
+ <div class="row"><button class="alt" onclick="busy(()=>api('draft/${d.id}/edit',{b:{subject:$('s${d.id}').value,body:$('b${d.id}').value}}))">Save edits</button>
+ <button class="alt" onclick="navigator.clipboard.writeText($('s${d.id}').value+'\\n\\n'+$('b${d.id}').value)">Copy</button>
+ ${S.draft_only?`<button class="alt" onclick="busy(()=>api('draft/${d.id}/sent',{b:{}}))">Mark as sent</button>`:""}</div>`).join("")+
+ `<div class="row"><button onclick="busy(()=>api('lead/${ds[0].lead_id}/approve',{b:{}}))">Approve sequence</button></div></div>`).join("")||`<div class="card">Nothing to review.</div>`}
+function Replies(){return `<div class="row"><button onclick="job('inbox')">Check inbox</button></div>
+<div class="card"><h2>Paste a reply</h2><div class="mute">Got a reply somewhere else (or in draft-only mode)? Paste it here to classify it and get a suggested answer.</div>
+<div class="row"><select id="pl" style="flex:1 1 220px">${S.leads.map(l=>`<option value="${l.id}">${esc(l.name)} (${esc(l.company)})</option>`).join("")}</select></div>
+<textarea id="pt" placeholder="Paste their reply"></textarea><div class="row"><button class="alt" onclick="job('paste',{id:$('pl').value,text:$('pt').value})">Classify reply</button></div></div>`+
+ (S.replies.map(r=>`<div class="card"><b>${esc(r.name)}</b> <span class="mute">${esc(r.company)}</span> <span class="flag">${esc(r.label)}</span>
+ <pre>${esc(r.body)}</pre><div class="mute">Suggested reply:</div><pre>${esc(r.suggested)}</pre></div>`).join("")||`<div class="card">No replies yet.</div>`)}
+function Insights(){const i=S.ins;return `<div class="card"><h2>What predicts replies</h2><div class="mute">${i.contacted} leads contacted</div><p>${esc(i.tip)}</p></div>`+
+ (i.rows.length?`<div class="card" style="overflow-x:auto"><table style="width:100%;border-collapse:collapse"><tr style="text-align:left"><th>Factor</th><th>Group</th><th>Leads</th><th>Replies</th><th>Reply rate</th><th>Interested</th></tr>`+
+ i.rows.map(r=>`<tr style="border-top:1px solid var(--line)"><td>${esc(r.factor)}</td><td>${esc(r.group)}</td><td>${r.leads}</td><td>${r.replies}</td><td>${r.reply_rate}%</td><td>${r.positive}</td></tr>`).join("")+`</table></div>`:`<div class="card">No sent emails yet.</div>`)}
+if(PW)load();else login();
+</script></body></html>
